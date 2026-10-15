@@ -33,15 +33,10 @@ typedef struct minicpm_load_params {
     // The experts/ directory holding manifest.json and the layer_NNN.bin shards that
     // were split from the same model as model_path.
     const char * experts_path;
-    // DSpark draft model for speculative decoding. "" disables speculative decoding.
-    const char * draft_model_path;
 
     int32_t n_ctx;
     int32_t n_threads;
-    // Sampling temperature; 0 = greedy. The sampler is built at load, so changing it
-    // needs a reload.
-    float temperature;
-    // The physical batch is not a parameter: the bridge sizes it itself, starting small
+    // Sampling is per request (minicpm_chat_completions). The physical batch is not a parameter: the bridge sizes it itself, starting small
     // and growing it for the first long or image prompt (capped at 1024 while the
     // decode window is active).
 
@@ -58,12 +53,10 @@ typedef struct minicpm_load_params {
     // Next-layer experts predicted and prefetched per step; 0 = off. The prefetch
     // slots are added to the decode window, outside the c cache slots.
     int32_t moe_lookahead_prefetch_depth;
-    // Experts per layer read into the decode window before the first token; 0 = off.
-    // Capped to the decode window that was actually granted.
-    int32_t moe_prewarm_level;
-    // DSpark draft tokens per round; 0 = off. Clamped so the verify batch still fits
-    // the decode window, and forced to 0 without a draft model.
-    int32_t spec_draft_n_max;
+    // Not offered: the MiniCPM-V app's expert prewarm and DSpark speculative decoding.
+    // Both hang off the app's own turn-by-turn flow (prewarm runs between picking an
+    // image and sending it; DSpark replaces the sampling loop), which requests that
+    // carry the whole conversation and sample like llama-server do not go through.
 } minicpm_load_params;
 
 // The values the MiniCPM-V iOS app ships for MiniCPM-V 4.7 35B-A3B, with every path "".
@@ -73,8 +66,6 @@ minicpm_load_params minicpm_load_params_default(void);
 typedef struct minicpm_load_info {
     int32_t moe_decode_window;
     int32_t moe_lookahead_prefetch_depth;
-    int32_t moe_prewarm_level;
-    int32_t spec_draft_n_max;
     int32_t moe_slot_bank;
     // Bytes of one expert slot across the routed families, averaged over layers, and
     // the number of routed layers, both read from the experts manifest.
@@ -91,55 +82,68 @@ void minicpm_free(minicpm_engine * engine);
 
 minicpm_load_info minicpm_get_load_info(const minicpm_engine * engine);
 
-// Clears the KV cache so the next turn starts a new conversation.
-bool minicpm_reset(minicpm_engine * engine);
+// ---- OpenAI Chat Completions (minicpm_oai.cpp) ---------------------------------
+//
+// Requests are llama-server /v1/chat/completions bodies and are read by llama-server's
+// own code: the prompt comes from the model's chat template in its GGUF (tools, tool
+// results, reasoning, images, continue_final_message), sampling, stop and limits from
+// the body, with grammars and lazy tool-call grammars, and the reply is parsed into
+// content, reasoning_content and tool_calls as llama-server parses it. Images are
+// image_url parts (data: URLs); audio is refused, as the model has no audio tower.
+// Layla's reasoning_effort: "none" turns thinking off (chat_template_kwargs wins).
+//
+// The engine keeps the conversation it last finished in its KV cache and, when the
+// next prompt extends it, prefills only the new part. A prompt that shares only some of
+// it (a regenerated reply, an edited message) prefills from the start: most of the
+// model's layers are recurrent and cannot be rolled back.
 
-// Encodes an image now and folds it into the next user turn. The vision encode and the
-// expert prewarm run here, so call it as soon as the user attaches the image rather
-// than when the message is sent. Returns false on failure; see minicpm_last_error.
-bool minicpm_add_image(minicpm_engine * engine, const char * image_path);
+// Receives each chat.completion.chunk as JSON, on the calling thread.
+typedef void (*minicpm_chunk_callback)(const char * chunk_json, void * user_data);
+// Polled before each generated token; true stops the generation, which then ends as
+// if the model had stopped (finish_reason "stop", partial content).
+typedef bool (*minicpm_cancel_callback)(void * user_data);
 
-// Appends one ChatML turn to the KV cache. role is "system", "user" or "assistant".
-// A user turn ends with the assistant header (thinking off), so minicpm_generate can
-// follow it directly. An assistant turn is history the model did not generate here.
-bool minicpm_add_text(minicpm_engine * engine, const char * role, const char * text);
+// Serves one request. Streams chunks when the request sets "stream": true. Returns the
+// finished chat.completion as JSON, to be released with minicpm_string_free, or NULL
+// with the reason in minicpm_last_error. A prompt that does not fit the context fails
+// with llama-server's error body, {"error":{"type":"exceed_context_size_error",
+// "n_prompt_tokens":..,"n_ctx":..}}, so callers can trim and retry the same way.
+char * minicpm_chat_completions(minicpm_engine * engine,
+                                const char * request_json,
+                                minicpm_chunk_callback on_chunk,
+                                minicpm_cancel_callback is_cancelled,
+                                void * user_data);
 
-// Receives each complete UTF-8 piece. Return false to stop generating.
-typedef bool (*minicpm_token_callback)(const char * piece, void * user_data);
+// The prompt text a request becomes, exactly as the engine feeds it (images appear as
+// mtmd's media marker). Reads only the template and vocabulary from model_path, so it
+// needs no loaded engine. Returns a string to release with minicpm_string_free, or
+// NULL with the reason in error.
+char * minicpm_render_prompt(const char * model_path,
+                             const char * request_json,
+                             char * error,
+                             size_t error_size);
 
-typedef enum minicpm_finish_reason {
-    // The model ended its turn; the KV cache holds a closed assistant turn and the
-    // next minicpm_add_text continues the conversation.
-    MINICPM_FINISH_EOS = 0,
-    // n_predict was reached, or the callback returned false. The assistant turn is
-    // still open in the KV cache: reset and replay the conversation before the next
-    // turn.
-    MINICPM_FINISH_LENGTH = 1,
-    MINICPM_FINISH_STOPPED = 2,
-    MINICPM_FINISH_ERROR = 3,
-} minicpm_finish_reason;
+// What the model's chat template can express, as llama-server reports it.
+typedef struct minicpm_template_caps {
+    bool supports_tools;
+    bool supports_tool_calls;
+    bool supports_parallel_tool_calls;
+    bool supports_system_role;
+    bool supports_preserve_reasoning;
+    bool supports_reasoning_effort;
+    bool supports_string_content;
+    bool supports_typed_content;
+    bool supports_object_arguments;
+} minicpm_template_caps;
 
-typedef struct minicpm_perf {
-    int32_t prefill_tokens;
-    int32_t decode_tokens;
-    double prefill_ms;
-    double decode_ms;
-    // Send-turn work outside prefill: vision reload, image decode, tokenisation.
-    double prep_ms;
-    // The eager image encode done in minicpm_add_image.
-    int32_t image_tokens;
-    double image_encode_ms;
-} minicpm_perf;
+// Reads only the template from model_path. False, with the reason in error, when the
+// file cannot be read or has no chat template.
+bool minicpm_read_template_caps(const char * model_path,
+                                minicpm_template_caps * caps,
+                                char * error,
+                                size_t error_size);
 
-// Generates the assistant reply to the turns added since the last generation.
-// n_predict <= 0 means no limit beyond the context. When the turn ends, the expert
-// window's memory is released until the next decode, as the MiniCPM-V app does between
-// turns; perf (may be NULL) receives the turn's counters.
-minicpm_finish_reason minicpm_generate(minicpm_engine * engine,
-                                       int32_t n_predict,
-                                       minicpm_token_callback on_token,
-                                       void * user_data,
-                                       minicpm_perf * perf);
+void minicpm_string_free(char * s);
 
 // Overrides the slice cap for the next image; -1 restores the model default.
 void minicpm_set_image_max_slice_nums(minicpm_engine * engine, int32_t n);

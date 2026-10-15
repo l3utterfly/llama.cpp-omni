@@ -9,6 +9,7 @@ endif()
 
 get_filename_component(OMNI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(MINICPM_BRIDGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/minicpm-v-apps")
+set(MINICPM_SERVER_DIR "${OMNI_ROOT}/tools/server")
 
 # The bridge includes the public headers the way the MiniCPM-V app's llama.framework
 # lays them out (<llama/llama.h>). Forwarding headers reproduce that layout so the
@@ -24,16 +25,25 @@ foreach(header
     CONTENT "#pragma once\n#include \"${header}\"\n")
 endforeach()
 
+# Chat requests are read, rendered, sampled and parsed by llama-server's own code
+# (minicpm_oai.cpp). Only these three server sources are needed: the request and
+# response layer, without the HTTP server, the slot scheduler or omni's audio stack.
 add_library(minicpm_layla STATIC
   minicpm_capi.cpp
-  "${MINICPM_BRIDGE_DIR}/MBMtmd.mm")
+  minicpm_oai.cpp
+  "${MINICPM_BRIDGE_DIR}/MBMtmd.mm"
+  "${MINICPM_SERVER_DIR}/server-common.cpp"
+  "${MINICPM_SERVER_DIR}/server-task.cpp"
+  "${MINICPM_SERVER_DIR}/server-chat.cpp")
 
 target_include_directories(minicpm_layla
   PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}"          # minicpm_capi.h
+    "${CMAKE_CURRENT_SOURCE_DIR}"          # minicpm_capi.h, minicpm_engine.h
   PRIVATE
     "${MINICPM_BRIDGE_DIR}"                # MBMtmd.h, MBPrewarmTable.h
     "${MINICPM_FRAMEWORK_HEADERS}"         # <llama/llama.h>, <llama/mtmd*.h>
+    "${MINICPM_SERVER_DIR}"                # server-common.h, server-task.h, server-chat.h
+    "${OMNI_ROOT}/tools/mtmd"              # mtmd.h as the server sources include it
     "${OMNI_ROOT}/vendor")                 # <nlohmann/json.hpp>
 
 # The MiniCPM-V app builds the bridge as gnu++20 with ARC, and it relies on ARC to
@@ -41,8 +51,9 @@ target_include_directories(minicpm_layla
 target_compile_features(minicpm_layla PRIVATE cxx_std_20)
 set_source_files_properties("${MINICPM_BRIDGE_DIR}/MBMtmd.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
-# llama-common supplies the common_speculative_* symbols DSpark calls. The bridge
-# declares those structs itself rather than including common.h (see the ABI asserts in
+# llama-common supplies the chat templates, parsers and sampler, and the
+# common_speculative_* symbols the bridge's DSpark path calls. The bridge declares
+# those structs itself rather than including common.h (see the ABI asserts in
 # MBMtmd.mm), so the two must come from the same llama.cpp-omni revision.
 target_link_libraries(minicpm_layla
   PRIVATE

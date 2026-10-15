@@ -1,6 +1,4 @@
-#include "minicpm_capi.h"
-
-#include "MBMtmd.h"
+#include "minicpm_engine.h"
 
 #include <nlohmann/json.hpp>
 
@@ -19,12 +17,6 @@
 #include <string>
 #include <utility>
 
-struct minicpm_engine {
-    mb_mtmd_context * ctx;
-    minicpm_load_info info;
-    std::string last_error;
-};
-
 namespace {
 
 // The memory policy below is a port of MiniCPMV47Const and MBDeviceMemoryProbe from the
@@ -39,10 +31,6 @@ constexpr int64_t kGiB = 1024 * kMiB;
 // that cannot hold a single step.
 constexpr int32_t kExpertsUsed = 8;
 constexpr int32_t kDecodeWindowStep = 8;
-constexpr int32_t kPrewarmLevels[] = {8, 16, 32, 48, 64, 96};
-// The app pins the K4-total-1 cluster table from MBPrewarmTable.h; with a cluster
-// table the bridge truncates its 96 rows per layer to the decode window.
-constexpr int32_t kPrewarmTableId = 1;
 // The bridge reads these as "-1 = model default"; the app's V4.7 values differ.
 constexpr int32_t kImageMaxTokens = 512;
 constexpr int32_t kImageMaxSliceNums = 9;
@@ -128,11 +116,11 @@ int64_t memory_ceiling_bytes(device_tier tier) {
 // Resident memory the window must leave room for, measured by the app: baseline,
 // mmproj, Metal compute, recurrent state and a 2k-token KV come to 2400 MiB. Only 10 of
 // the 40 layers carry KV, at 20 KiB per token, so a longer context adds its share past
-// 2k. A DSpark draft model with its context adds about 600 MiB.
-int64_t reserve_bytes(int32_t n_ctx, bool spec) {
+// 2k.
+int64_t reserve_bytes(int32_t n_ctx) {
     const int64_t kv_mib = std::llround(static_cast<double>(n_ctx) * 20480.0 / static_cast<double>(kMiB));
     const int64_t kv_extra_mib = std::max<int64_t>(0, kv_mib - 40);
-    return (2400 + kv_extra_mib + (spec ? 600 : 0)) * kMiB;
+    return (2400 + kv_extra_mib) * kMiB;
 }
 
 struct experts_layout {
@@ -200,12 +188,11 @@ bool read_experts_layout(const std::string & experts_dir, experts_layout & out, 
 int32_t budget_decode_window(const experts_layout & layout,
                              int32_t prefetch_slots,
                              int32_t n_ctx,
-                             bool spec,
                              device_tier tier) {
     const int64_t available = available_process_bytes();
     const int64_t by_ceiling = std::max<int64_t>(0, memory_ceiling_bytes(tier) - footprint_bytes());
     const int64_t headroom = available > 0 ? std::min(available, by_ceiling) : by_ceiling;
-    const int64_t budget = headroom - reserve_bytes(n_ctx, spec);
+    const int64_t budget = headroom - reserve_bytes(n_ctx);
     if (budget <= 0) {
         return 0;
     }
@@ -218,7 +205,6 @@ int32_t resolve_decode_window(int32_t requested_raw,
                               const experts_layout & layout,
                               int32_t prefetch_slots,
                               int32_t n_ctx,
-                              bool spec,
                               device_tier tier) {
     const int32_t requested = requested_raw == MINICPM_DECODE_WINDOW_AUTO
         ? default_decode_window(tier)
@@ -226,37 +212,12 @@ int32_t resolve_decode_window(int32_t requested_raw,
     if (requested == 0) {
         return 0;
     }
-    const int32_t budget = budget_decode_window(layout, prefetch_slots, n_ctx, spec, tier);
+    const int32_t budget = budget_decode_window(layout, prefetch_slots, n_ctx, tier);
     if (budget > 0) {
         return clamp_decode_window(std::min(requested, budget), tier);
     }
     // Without a usable probe the request cannot be trusted as is; fall back to the tier.
     return std::min(requested, default_decode_window(tier));
-}
-
-// Prewarm fills the cache part of the window, so it never exceeds c.
-int32_t resolve_prewarm_level(int32_t requested, int32_t decode_window) {
-    if (requested <= 0 || decode_window <= 0) {
-        return 0;
-    }
-    const int32_t cap = std::min(requested, decode_window);
-    int32_t level = 0;
-    for (const int32_t candidate : kPrewarmLevels) {
-        if (candidate <= cap) {
-            level = candidate;
-        }
-    }
-    return level;
-}
-
-// The verify batch is n_max + 1 rows and must fit the window (slots / experts per row);
-// a batch that falls out of the window measured 20 -> 2.3 tok/s in the app.
-int32_t resolve_spec_n_max(int32_t requested, int32_t window_slots) {
-    if (requested <= 0) {
-        return 0;
-    }
-    const int32_t max_rows = std::max(1, window_slots / kExpertsUsed);
-    return std::min(requested, std::max(0, max_rows - 1));
 }
 
 bool empty(const char * s) {
@@ -278,17 +239,13 @@ minicpm_load_params minicpm_load_params_default(void) {
     p.model_path = "";
     p.mmproj_path = "";
     p.experts_path = "";
-    p.draft_model_path = "";
     p.n_ctx = 4096;
     p.n_threads = 4;
-    p.temperature = 0.7f;
     p.image_max_tokens = kImageMaxTokens;
     p.image_max_slice_nums = kImageMaxSliceNums;
     p.moe_slot_bank = 256;
     p.moe_decode_window = MINICPM_DECODE_WINDOW_AUTO;
     p.moe_lookahead_prefetch_depth = 8;
-    p.moe_prewarm_level = 32;
-    p.spec_draft_n_max = 0;
     return p;
 }
 
@@ -313,17 +270,11 @@ minicpm_engine * minicpm_load(const minicpm_load_params * params, char * error, 
     const device_tier tier = tier_for(gib);
     const int32_t n_ctx = params->n_ctx > 0 ? params->n_ctx : 4096;
     const int32_t prefetch = std::clamp(params->moe_lookahead_prefetch_depth, 0, 16);
-    const int32_t spec_requested =
-        empty(params->draft_model_path) ? 0 : std::clamp(params->spec_draft_n_max, 0, 16);
-    const int32_t window = resolve_decode_window(
-        params->moe_decode_window, layout, prefetch, n_ctx, spec_requested > 0, tier);
-    const int32_t prewarm = resolve_prewarm_level(params->moe_prewarm_level, window);
-    const int32_t spec = resolve_spec_n_max(spec_requested, window + prefetch);
+    const int32_t window = resolve_decode_window(params->moe_decode_window, layout, prefetch, n_ctx, tier);
 
     mb_mtmd_params mp = mb_mtmd_params_default();
     mp.n_ctx = n_ctx;
     mp.n_threads = params->n_threads > 0 ? params->n_threads : 4;
-    mp.temperature = params->temperature;
     // The simulator's Metal device aborts on the 1+ GiB mmproj buffer.
     mp.use_gpu = !TARGET_OS_SIMULATOR;
     mp.mmproj_use_gpu = !TARGET_OS_SIMULATOR;
@@ -334,30 +285,32 @@ minicpm_engine * minicpm_load(const minicpm_load_params * params, char * error, 
     mp.moe_slot_bank = std::max(params->moe_slot_bank, kExpertsUsed);
     mp.moe_decode_window = window;
     mp.moe_lookahead_prefetch_depth = prefetch;
-    mp.moe_prewarm_level = prewarm;
-    mp.moe_prewarm_table_id = kPrewarmTableId;
-    mp.spec_draft_n_max = spec;
+    mp.moe_prewarm_level = 0;
+    mp.spec_draft_n_max = 0;
 
     mb_mtmd_context * ctx = mb_mtmd_init(params->model_path,
                                          params->mmproj_path,
                                          params->experts_path,
-                                         spec > 0 ? params->draft_model_path : "",
+                                         /*draft_model_path=*/"",
                                          &mp);
     if (ctx == nullptr) {
         write_error(error, error_size, std::string("minicpm_load: ") + mb_mtmd_last_init_error());
         return nullptr;
     }
-    // An experts path already selects V4.7 inside the bridge; set it explicitly so the
-    // ChatML template does not depend on that side effect. V4.7 runs with thinking off.
+    // An experts path already selects V4.7 inside the bridge; set it explicitly so its
+    // V4.7 behaviour (the image and MoE paths) does not depend on that side effect.
     mb_mtmd_set_model_version(ctx, 47);
-    mb_mtmd_set_enable_thinking(ctx, false);
 
     auto * engine = new minicpm_engine{};
     engine->ctx = ctx;
+    std::string chat_error;
+    if (!minicpm_init_chat(engine, chat_error)) {
+        write_error(error, error_size, "minicpm_load: " + chat_error);
+        minicpm_free(engine);
+        return nullptr;
+    }
     engine->info.moe_decode_window = window;
     engine->info.moe_lookahead_prefetch_depth = prefetch;
-    engine->info.moe_prewarm_level = prewarm;
-    engine->info.spec_draft_n_max = spec;
     engine->info.moe_slot_bank = mp.moe_slot_bank;
     engine->info.moe_bytes_per_slot = layout.bytes_per_slot;
     engine->info.moe_layer_count = layout.layers;
@@ -375,104 +328,6 @@ void minicpm_free(minicpm_engine * engine) {
 
 minicpm_load_info minicpm_get_load_info(const minicpm_engine * engine) {
     return engine != nullptr ? engine->info : minicpm_load_info{};
-}
-
-bool minicpm_reset(minicpm_engine * engine) {
-    if (engine == nullptr) {
-        return false;
-    }
-    engine->last_error.clear();
-    if (!mb_mtmd_clean_kv_cache(engine->ctx)) {
-        engine->last_error = "failed to clear the KV cache";
-        return false;
-    }
-    return true;
-}
-
-bool minicpm_add_image(minicpm_engine * engine, const char * image_path) {
-    if (engine == nullptr) {
-        return false;
-    }
-    engine->last_error.clear();
-    if (mb_mtmd_prefill_image(engine->ctx, image_path) != 0) {
-        engine->last_error = mb_mtmd_get_last_error(engine->ctx);
-        return false;
-    }
-    // Kept apart from the encode in the bridge so the app could time them separately;
-    // both belong to "the user attached an image", before the message is sent.
-    if (mb_mtmd_prewarm_after_image(engine->ctx) != 0) {
-        engine->last_error = mb_mtmd_get_last_error(engine->ctx);
-        return false;
-    }
-    return true;
-}
-
-bool minicpm_add_text(minicpm_engine * engine, const char * role, const char * text) {
-    if (engine == nullptr) {
-        return false;
-    }
-    engine->last_error.clear();
-    if (mb_mtmd_prefill_text(engine->ctx, text, role) != 0) {
-        engine->last_error = mb_mtmd_get_last_error(engine->ctx);
-        return false;
-    }
-    return true;
-}
-
-minicpm_finish_reason minicpm_generate(minicpm_engine * engine,
-                                       int32_t n_predict,
-                                       minicpm_token_callback on_token,
-                                       void * user_data,
-                                       minicpm_perf * perf) {
-    if (engine == nullptr) {
-        return MINICPM_FINISH_ERROR;
-    }
-    engine->last_error.clear();
-
-    // mb_mtmd_loop reports a failed decode as the end of generation and records the
-    // reason on the context, so a changed error string is how the two are told apart.
-    const std::string error_before = mb_mtmd_get_last_error(engine->ctx);
-    minicpm_finish_reason reason = MINICPM_FINISH_LENGTH;
-    int32_t generated = 0;
-    while (n_predict <= 0 || generated < n_predict) {
-        const mb_mtmd_token token = mb_mtmd_loop(engine->ctx);
-        bool keep_going = true;
-        // A NULL piece mid-turn is a UTF-8 sequence still being assembled.
-        if (token.token != nullptr) {
-            if (on_token != nullptr && token.token[0] != '\0') {
-                keep_going = on_token(token.token, user_data);
-            }
-            mb_mtmd_string_free(token.token);
-        }
-        if (token.is_end) {
-            const std::string error_after = mb_mtmd_get_last_error(engine->ctx);
-            if (error_after != error_before) {
-                engine->last_error = error_after;
-                reason = MINICPM_FINISH_ERROR;
-            } else {
-                reason = MINICPM_FINISH_EOS;
-            }
-            break;
-        }
-        ++generated;
-        if (!keep_going) {
-            reason = MINICPM_FINISH_STOPPED;
-            break;
-        }
-    }
-
-    // Closing the turn also parks the expert window's memory until the next decode.
-    const mb_mtmd_perf p = mb_mtmd_perf_snapshot(engine->ctx);
-    if (perf != nullptr) {
-        perf->prefill_tokens = p.prefill_tokens;
-        perf->decode_tokens = p.decode_tokens;
-        perf->prefill_ms = p.prefill_ms;
-        perf->decode_ms = p.decode_ms;
-        perf->prep_ms = p.prep_ms;
-        perf->image_tokens = p.image_tokens;
-        perf->image_encode_ms = p.image_encode_ms;
-    }
-    return reason;
 }
 
 void minicpm_set_image_max_slice_nums(minicpm_engine * engine, int32_t n) {

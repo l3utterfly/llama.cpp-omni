@@ -3152,3 +3152,125 @@ mb_mtmd_token mb_mtmd_loop(mb_mtmd_context * ctx) {
     result.is_end = false;
     return result;
 }
+
+// ---------------------------------------------------------------------------
+//  LAYLA: additions for Layla's OpenAI-compatible front end (see MBMtmd.h)
+// ---------------------------------------------------------------------------
+
+int32_t mb_mtmd_layla_n_past(const mb_mtmd_context * ctx) {
+    return ctx ? static_cast<int32_t>(ctx->n_past) : 0;
+}
+
+int32_t mb_mtmd_layla_n_ctx(const mb_mtmd_context * ctx) {
+    return ctx ? ctx->n_ctx_cur : 0;
+}
+
+struct llama_context * mb_mtmd_layla_llama_context(mb_mtmd_context * ctx) {
+    return ctx ? ctx->lctx.get() : nullptr;
+}
+
+const struct llama_model * mb_mtmd_layla_model(const mb_mtmd_context * ctx) {
+    return ctx ? ctx->model.get() : nullptr;
+}
+
+// The vision half of mb_mtmd_prefill_text, for text that is already a rendered prompt
+// and images given as encoded bytes.
+int mb_mtmd_layla_prefill_prompt(mb_mtmd_context * ctx,
+                                 const char * prompt,
+                                 const unsigned char * const * images,
+                                 const size_t * image_sizes,
+                                 int32_t n_images,
+                                 int32_t token_budget,
+                                 int32_t * n_new_tokens) {
+    if (!ctx || !ctx->lctx || !ctx->vision || !prompt) {
+        if (ctx) set_error(ctx, "layla_prefill_prompt: not a multimodal context");
+        return -1;
+    }
+    if (!ctx->perf_turn_open) {
+        llama_perf_context_reset(ctx->lctx.get());
+    }
+    const double t0 = now_ms();
+    const bool opening_turn = ctx->n_past == 0;
+
+    // Nothing from the app's eager image path applies here.
+    ctx->pending_image_path.clear();
+    ctx->pending_image.clear();
+
+    if (n_images > 0 && !mb_ensure_vision(ctx, "layla_prefill_prompt (images)")) {
+        return -1;
+    }
+    std::vector<std::unique_ptr<mtmd_bitmap, void(*)(mtmd_bitmap*)>> owned;
+    std::vector<const mtmd_bitmap *> bitmaps;
+    for (int32_t i = 0; i < n_images; ++i) {
+        mtmd_bitmap * bmp = mtmd_helper_bitmap_init_from_buf(ctx->vision.get(), images[i], image_sizes[i]);
+        if (!bmp) {
+            set_error(ctx, "layla_prefill_prompt: failed to decode image " + std::to_string(i));
+            return -1;
+        }
+        owned.emplace_back(bmp, mtmd_bitmap_free);
+        bitmaps.push_back(bmp);
+    }
+
+    mtmd_input_text in = {};
+    in.text          = prompt;
+    in.add_special   = opening_turn;
+    in.parse_special = true;
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    if (!chunks) {
+        set_error(ctx, "layla_prefill_prompt: mtmd_input_chunks_init failed");
+        return -1;
+    }
+    std::unique_ptr<mtmd_input_chunks, void(*)(mtmd_input_chunks*)> chunks_guard(chunks, mtmd_input_chunks_free);
+    const int32_t res = mtmd_tokenize(ctx->vision.get(), chunks, &in,
+                                      bitmaps.empty() ? nullptr : bitmaps.data(), bitmaps.size());
+    if (res != 0) {
+        set_error(ctx, "layla_prefill_prompt: mtmd_tokenize failed, res=" + std::to_string(res));
+        return -1;
+    }
+
+    // Tokens, not positions, are what fill the KV cache.
+    const int32_t new_tokens = static_cast<int32_t>(mtmd_helper_get_n_tokens(chunks));
+    if (n_new_tokens) *n_new_tokens = new_tokens;
+    if (new_tokens > token_budget) {
+        return -2;
+    }
+
+    const llama_pos start_n_past = ctx->n_past;
+    llama_pos new_n_past = start_n_past;
+    const double t_prefill_start = now_ms();
+    const int32_t ev = eval_prefill(ctx, chunks, /*logits_last=*/true, &new_n_past);
+    if (ev != 0) {
+        rollback_to_n_past(ctx, start_n_past);
+        set_error(ctx, "layla_prefill_prompt: eval_prefill failed, ret=" + std::to_string(ev));
+        return -1;
+    }
+    ctx->n_past = new_n_past;
+    perf_add_prep  (ctx, t_prefill_start - t0);
+    perf_add_prefill(ctx, new_tokens, t_prefill_start);
+
+    // As in mb_mtmd_prefill_text: once image embeddings are in the KV cache the vision
+    // model is dead weight (~1 GiB) until the next image.
+    if (n_images > 0 || opening_turn) {
+        mb_release_vision(ctx, n_images > 0 ? "layla image prefill" : "layla opening turn");
+    }
+    return 0;
+}
+
+// The decode half of mb_mtmd_loop's base path, for a token sampled by the caller.
+int mb_mtmd_layla_decode_token(mb_mtmd_context * ctx, int32_t token) {
+    if (!ctx || !ctx->lctx) return -1;
+    const double t0 = now_ms();
+    perf_begin_turn_if_needed(ctx);
+    batch_add_one(ctx->batch, token, ctx->n_past, /*seq=*/0);
+    ctx->n_past++;
+    apply_moe_k(ctx, ctx->moe_k_decode > 0 ? ctx->moe_k_decode : MB_MOE_K_DECODE);
+    if (llama_decode(ctx->lctx.get(), ctx->batch) != 0) {
+        ctx->perf_decode_ms += std::max(0.0, now_ms() - t0);
+        set_error(ctx, "layla_decode_token: llama_decode failed");
+        return -1;
+    }
+    ctx->perf_decode_tokens += 1;
+    ctx->perf_decode_ms += std::max(0.0, now_ms() - t0);
+    return 0;
+}

@@ -277,6 +277,42 @@ void mb_mtmd_set_image_max_slice_nums(mb_mtmd_context * ctx, int n);
 int mb_mtmd_set_moe_lookahead_prefetch_depth(mb_mtmd_context * ctx, int depth);
 int mb_mtmd_get_moe_lookahead_prefetch_depth(const mb_mtmd_context * ctx);
 
+// LAYLA: additions for Layla's OpenAI-compatible front end (layla/minicpm_oai.cpp).
+// It renders prompts with llama.cpp's chat templates and samples with llama.cpp's
+// common sampler, the way llama-server does, and uses the bridge for what it is tuned
+// for: prefill (vision model release, embedding batch, adaptive ubatch) and the
+// MoE decode step.
+
+// The next position in the KV cache, and the context size (in tokens) it was built
+// with. Positions are not tokens: an image takes a token per embedding but, on
+// MiniCPM-V's canvas, far fewer positions.
+int32_t mb_mtmd_layla_n_past(const mb_mtmd_context * ctx);
+int32_t mb_mtmd_layla_n_ctx(const mb_mtmd_context * ctx);
+
+// The llama.cpp objects behind the bridge, for sampling and detokenizing. Owned by
+// the bridge; valid until the next prefill (an adaptive ubatch change rebuilds the
+// context) or mb_mtmd_free.
+struct llama_context * mb_mtmd_layla_llama_context(mb_mtmd_context * ctx);
+const struct llama_model * mb_mtmd_layla_model(const mb_mtmd_context * ctx);
+
+// Appends `prompt` to the KV cache through the bridge's prefill path, with logits for
+// its last token. Images appear in the text as mtmd's default media marker, one per
+// image, in order; each is an encoded file (PNG, JPEG, ...) in memory. n_new_tokens,
+// when not NULL, receives the tokens the prompt adds (image embeddings included).
+// Returns 0 on success; -2, without touching the KV cache, when that is more than
+// token_budget; -1 on any other failure (see mb_mtmd_get_last_error).
+int mb_mtmd_layla_prefill_prompt(mb_mtmd_context * ctx,
+                                 const char * prompt,
+                                 const unsigned char * const * images,
+                                 const size_t * image_sizes,
+                                 int32_t n_images,
+                                 int32_t token_budget,
+                                 int32_t * n_new_tokens);
+
+// Appends one token the caller sampled, through the bridge's decode step (MoE top-k,
+// decode timing), leaving logits for it. Returns 0, or -1 on failure.
+int mb_mtmd_layla_decode_token(mb_mtmd_context * ctx, int32_t token);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
