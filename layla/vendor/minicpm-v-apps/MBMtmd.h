@@ -314,6 +314,24 @@ int mb_mtmd_layla_prefill_prompt(mb_mtmd_context * ctx,
 // decode timing), leaving logits for it. Returns 0, or -1 on failure.
 int mb_mtmd_layla_decode_token(mb_mtmd_context * ctx, int32_t token);
 
+// Writes what the KV cache holds to path (llama_state_seq_save_file, sequence 0), with
+// the bridge's position counter and the caller's `meta` stored as the file's token list.
+// Returns the bytes written, or 0 on failure (see mb_mtmd_get_last_error).
+size_t mb_mtmd_layla_state_save(mb_mtmd_context * ctx,
+                                const char * path,
+                                const int32_t * meta,
+                                size_t n_meta);
+
+// Replaces what the KV cache holds with a state mb_mtmd_layla_state_save wrote, leaving
+// the context as the prefill that built it did: sized for an opening turn and with the
+// vision model released. *meta receives the caller's meta, to be released with free().
+// Returns the bytes read, or 0 on failure -- a missing, truncated or incompatible file
+// -- with the KV cache left empty and *meta NULL.
+size_t mb_mtmd_layla_state_load(mb_mtmd_context * ctx,
+                                const char * path,
+                                int32_t ** meta,
+                                size_t * n_meta);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

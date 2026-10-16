@@ -143,6 +143,26 @@ bool minicpm_read_template_caps(const char * model_path,
                                 char * error,
                                 size_t error_size);
 
+// ---- Saved conversations (minicpm_oai.cpp) ----------------------------------------
+//
+// One file holds what the KV cache holds together with the engine's record of which
+// prompt and images built it, so a conversation resumes after the engine is freed and
+// loaded again: when the next request extends the restored prompt, only the new part
+// is prefilled. As above, a request that does not extend it prefills from the start, so
+// a file from another conversation costs a read and nothing else.
+
+// Writes the conversation in the KV cache to path. Only a reply the model ended itself
+// leaves one a request can extend; anything else (no request yet, a cancelled or failed
+// one) fails, so a file saved earlier is not replaced by a state nothing could resume.
+// Returns the bytes written, or -1 with the reason in minicpm_last_error.
+int64_t minicpm_save_state(minicpm_engine * engine, const char * path);
+
+// Replaces the conversation in the KV cache with the one saved in path. Returns the
+// tokens restored, or -1 with the reason in minicpm_last_error when the file is missing,
+// truncated or was not written by this engine for a context that fits; the cache is then
+// left empty, so the next request prefills as it would have anyway.
+int32_t minicpm_restore_state(minicpm_engine * engine, const char * path);
+
 void minicpm_string_free(char * s);
 
 // Overrides the slice cap for the next image; -1 restores the model default.

@@ -22,11 +22,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -400,6 +402,63 @@ void load_template(const char * model_path, template_source & out) {
     }
 }
 
+// A saved conversation's record, packed into the int32 token list the bridge stores with
+// the KV cache: magic, version, kv_tokens, the number of strings (the cached prompt, then
+// one key per image), each one's byte length, and then their bytes, padded to whole
+// int32s. The magic keeps any other engine's sequence state from passing for one.
+constexpr int32_t kStateMagic = 0x4C4D4356;  // "LMCV"
+constexpr int32_t kStateVersion = 1;
+
+std::vector<int32_t> pack_record(const minicpm_engine & e) {
+    std::vector<const std::string *> strings{&e.cached_prompt};
+    for (const auto & key : e.cached_images) {
+        strings.push_back(&key);
+    }
+    std::vector<int32_t> out{kStateMagic, kStateVersion, e.kv_tokens, static_cast<int32_t>(strings.size())};
+    std::string bytes;
+    for (const std::string * s : strings) {
+        if (s->size() > static_cast<size_t>(INT32_MAX)) {
+            throw std::runtime_error("the conversation is too large to save");
+        }
+        out.push_back(static_cast<int32_t>(s->size()));
+        bytes += *s;
+    }
+    bytes.resize((bytes.size() + sizeof(int32_t) - 1) / sizeof(int32_t) * sizeof(int32_t), '\0');
+    const size_t head = out.size();
+    out.resize(head + bytes.size() / sizeof(int32_t));
+    std::memcpy(out.data() + head, bytes.data(), bytes.size());
+    return out;
+}
+
+// False when meta is not a record this version wrote.
+bool unpack_record(const int32_t * meta, size_t n, minicpm_engine & e) {
+    if (n < 5 || meta[0] != kStateMagic || meta[1] != kStateVersion || meta[2] <= 0 || meta[3] < 1) {
+        return false;
+    }
+    const size_t n_strings = static_cast<size_t>(meta[3]);
+    if (n_strings > n - 4) {
+        return false;
+    }
+    const char * bytes = reinterpret_cast<const char *>(meta + 4 + n_strings);
+    const size_t available = (n - 4 - n_strings) * sizeof(int32_t);
+    std::vector<std::string> strings;
+    size_t at = 0;
+    for (size_t i = 0; i < n_strings; ++i) {
+        if (meta[4 + i] < 0 || static_cast<size_t>(meta[4 + i]) > available - at) {
+            return false;
+        }
+        strings.emplace_back(bytes + at, static_cast<size_t>(meta[4 + i]));
+        at += static_cast<size_t>(meta[4 + i]);
+    }
+    if (strings[0].empty()) {
+        return false;
+    }
+    e.kv_tokens = meta[2];
+    e.cached_prompt = std::move(strings[0]);
+    e.cached_images.assign(std::make_move_iterator(strings.begin() + 1), std::make_move_iterator(strings.end()));
+    return true;
+}
+
 void write_error(char * error, size_t error_size, const char * message) {
     if (error != nullptr && error_size > 0) {
         std::snprintf(error, error_size, "%s", message);
@@ -487,6 +546,63 @@ bool minicpm_read_template_caps(const char * model_path,
         write_error(error, error_size, e.what());
     }
     return false;
+}
+
+int64_t minicpm_save_state(minicpm_engine * engine, const char * path) {
+    if (engine == nullptr) {
+        return -1;
+    }
+    engine->last_error.clear();
+    try {
+        if (path == nullptr || path[0] == '\0') {
+            throw std::runtime_error("no state file path");
+        }
+        if (engine->cached_prompt.empty() || engine->kv_tokens <= 0) {
+            throw std::runtime_error("the KV cache holds no finished reply to resume from");
+        }
+        const std::vector<int32_t> record = pack_record(*engine);
+        const size_t written = mb_mtmd_layla_state_save(engine->ctx, path, record.data(), record.size());
+        if (written == 0) {
+            throw std::runtime_error(mb_mtmd_get_last_error(engine->ctx));
+        }
+        return static_cast<int64_t>(written);
+    } catch (const std::exception & error) {
+        engine->last_error = error.what();
+    }
+    return -1;
+}
+
+int32_t minicpm_restore_state(minicpm_engine * engine, const char * path) {
+    if (engine == nullptr) {
+        return -1;
+    }
+    engine->last_error.clear();
+    // Whatever the cache held is gone from here on, restored or not.
+    engine->cached_prompt.clear();
+    engine->cached_images.clear();
+    engine->kv_tokens = 0;
+    try {
+        if (path == nullptr || path[0] == '\0') {
+            throw std::runtime_error("no state file path");
+        }
+        int32_t * meta = nullptr;
+        size_t n_meta = 0;
+        if (mb_mtmd_layla_state_load(engine->ctx, path, &meta, &n_meta) == 0) {
+            throw std::runtime_error(mb_mtmd_get_last_error(engine->ctx));
+        }
+        std::unique_ptr<int32_t, void (*)(void *)> owned(meta, std::free);
+        if (!unpack_record(meta, n_meta, *engine) || engine->kv_tokens > mb_mtmd_layla_n_ctx(engine->ctx)) {
+            engine->cached_prompt.clear();
+            engine->cached_images.clear();
+            engine->kv_tokens = 0;
+            mb_mtmd_clean_kv_cache(engine->ctx);
+            throw std::runtime_error(std::string("not a MiniCPM conversation state: ") + path);
+        }
+        return engine->kv_tokens;
+    } catch (const std::exception & error) {
+        engine->last_error = error.what();
+    }
+    return -1;
 }
 
 void minicpm_string_free(char * s) {

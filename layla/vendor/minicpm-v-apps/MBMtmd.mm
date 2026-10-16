@@ -3274,3 +3274,90 @@ int mb_mtmd_layla_decode_token(mb_mtmd_context * ctx, int32_t token) {
     ctx->perf_decode_ms += std::max(0.0, now_ms() - t0);
     return 0;
 }
+
+// The bridge's position counter goes first in the file's token list, ahead of the
+// caller's meta: positions are not tokens, so it cannot be recovered from the KV cache.
+size_t mb_mtmd_layla_state_save(mb_mtmd_context * ctx,
+                                const char * path,
+                                const int32_t * meta,
+                                size_t n_meta) {
+    if (!ctx || !ctx->lctx || !path || (n_meta > 0 && !meta)) {
+        if (ctx) set_error(ctx, "layla_state_save: bad arguments");
+        return 0;
+    }
+    std::vector<llama_token> packed;
+    packed.reserve(n_meta + 1);
+    packed.push_back(static_cast<llama_token>(ctx->n_past));
+    packed.insert(packed.end(), meta, meta + n_meta);
+    const size_t written = llama_state_seq_save_file(ctx->lctx.get(), path, /*seq_id=*/0,
+                                                     packed.data(), packed.size());
+    if (written == 0) {
+        set_error(ctx, std::string("layla_state_save: cannot write ") + path);
+    }
+    return written;
+}
+
+size_t mb_mtmd_layla_state_load(mb_mtmd_context * ctx,
+                                const char * path,
+                                int32_t ** meta,
+                                size_t * n_meta) {
+    if (meta) *meta = nullptr;
+    if (n_meta) *n_meta = 0;
+    if (!ctx || !path || !meta || !n_meta || !mb_mtmd_clean_kv_cache(ctx)) {
+        if (ctx) set_error(ctx, "layla_state_load: bad arguments");
+        return 0;
+    }
+    // A context rebuild drops the KV cache, so the one an opening turn would make
+    // happens now, while the cache is empty (see moe_adaptive_ubatch).
+    moe_adaptive_ubatch(ctx, /*has_image=*/false, /*n_tokens=*/0);
+    if (!ctx->lctx) {
+        return 0;  // the rebuild failed and said why
+    }
+
+    // llama_state_seq_load_file needs the token list's size up front; it sits after the
+    // magic and version, and must fit in the file.
+    uint32_t n_packed = 0;
+    {
+        std::unique_ptr<FILE, int (*)(FILE *)> file(std::fopen(path, "rb"), std::fclose);
+        uint32_t header[3] = {0, 0, 0};
+        if (!file || std::fread(header, sizeof(header), 1, file.get()) != 1 ||
+            std::fseek(file.get(), 0, SEEK_END) != 0) {
+            set_error(ctx, std::string("layla_state_load: cannot read ") + path);
+            return 0;
+        }
+        const long size = std::ftell(file.get());
+        n_packed = header[2];
+        if (n_packed < 1 || size < 0 ||
+            static_cast<uint64_t>(n_packed) * sizeof(llama_token) + sizeof(header) > static_cast<uint64_t>(size)) {
+            set_error(ctx, std::string("layla_state_load: not a state file: ") + path);
+            return 0;
+        }
+    }
+
+    std::vector<llama_token> packed(n_packed);
+    size_t n_read_tokens = 0;
+    const size_t read = llama_state_seq_load_file(ctx->lctx.get(), path, /*dest_seq_id=*/0,
+                                                  packed.data(), packed.size(), &n_read_tokens);
+    const llama_pos n_past = n_read_tokens > 0 ? packed[0] : 0;
+    if (read == 0 || n_read_tokens != n_packed || n_past <= 0 || n_past > ctx->n_ctx_cur) {
+        mb_mtmd_clean_kv_cache(ctx);  // nothing half-restored is left behind
+        set_error(ctx, std::string("layla_state_load: cannot restore ") + path);
+        return 0;
+    }
+
+    const size_t count = n_read_tokens - 1;
+    int32_t * out = static_cast<int32_t *>(std::malloc(std::max<size_t>(1, count) * sizeof(int32_t)));
+    if (!out) {
+        mb_mtmd_clean_kv_cache(ctx);
+        set_error(ctx, "layla_state_load: out of memory");
+        return 0;
+    }
+    std::copy(packed.begin() + 1, packed.end(), out);
+    ctx->n_past = n_past;
+    // The prefill that built this state released the vision model, as every opening turn
+    // does (mb_mtmd_layla_prefill_prompt); the next image loads it back.
+    mb_release_vision(ctx, "layla state restore");
+    *meta = out;
+    *n_meta = count;
+    return read;
+}
