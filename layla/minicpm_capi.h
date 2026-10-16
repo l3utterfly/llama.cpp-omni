@@ -24,6 +24,12 @@ typedef struct minicpm_engine minicpm_engine;
 // device's memory, as the MiniCPM-V iOS app does on first launch.
 #define MINICPM_DECODE_WINDOW_AUTO (-1)
 
+// Load progress, as llama-server reports it: stage is "text_model" (the main file) or
+// "mmproj_model" (the vision tower), progress runs from 0 to 1, or is negative while a
+// stage's progress cannot be measured. Called on the loading thread, often; the caller
+// throttles.
+typedef void (*minicpm_load_progress_callback)(const char * stage, float progress, void * user_data);
+
 typedef struct minicpm_load_params {
     // The expert-stripped main file, e.g. MiniCPM-V-4_7-35B-A3B-mix_q3gud_im-les.gguf.
     const char * model_path;
@@ -57,6 +63,10 @@ typedef struct minicpm_load_params {
     // Both hang off the app's own turn-by-turn flow (prewarm runs between picking an
     // image and sending it; DSpark replaces the sampling loop), which requests that
     // carry the whole conversation and sample like llama-server do not go through.
+
+    // NULL = no progress. user_data is passed back unchanged.
+    minicpm_load_progress_callback on_progress;
+    void * user_data;
 } minicpm_load_params;
 
 // The values the MiniCPM-V iOS app ships for MiniCPM-V 4.7 35B-A3B, with every path "".

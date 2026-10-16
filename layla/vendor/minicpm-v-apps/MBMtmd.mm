@@ -393,6 +393,13 @@ struct mb_mtmd_context {
 
     llama_pos           n_past = 0;      // position counter for seq=0
 
+    // LAYLA: the progress callback of the mb_mtmd_layla_prefill_prompt call in flight,
+    // and how far it has got, in tokens. Unset outside that call.
+    mb_mtmd_layla_progress_callback layla_prefill_progress = nullptr;
+    void *              layla_prefill_progress_user_data = nullptr;
+    int32_t             layla_prefill_done  = 0;
+    int32_t             layla_prefill_total = 0;
+
     bool                text_only = false; // true for text-only models (no mmproj)
 
     int                 model_version = 46; // 26=V2.6, 40=V4.0, 46=V4.6, 47=V4.7 MoE SSD, 471=V4.7 1B (dense), 5=MiniCPM5
@@ -1127,6 +1134,25 @@ static void mb_prewarm_moe_experts(mb_mtmd_context * ctx, const char * where) {
 
 static bool moe_adaptive_ubatch(mb_mtmd_context * ctx, bool has_image, int n_tokens);
 
+// LAYLA: n more prompt tokens are in the KV cache; tells the layla prefill in flight.
+static void layla_prefill_advance(mb_mtmd_context * ctx, int32_t n) {
+    if (!ctx->layla_prefill_progress) {
+        return;
+    }
+    ctx->layla_prefill_done = std::min(ctx->layla_prefill_total, ctx->layla_prefill_done + n);
+    ctx->layla_prefill_progress(ctx->layla_prefill_done, ctx->layla_prefill_total,
+                                ctx->layla_prefill_progress_user_data);
+}
+
+// LAYLA: with progress asked for, prefill decodes one ubatch per llama_decode -- the
+// split llama_decode makes internally anyway -- so progress can be told in between.
+static int32_t layla_prefill_step(mb_mtmd_context * ctx, int32_t n_batch) {
+    if (!ctx->layla_prefill_progress) {
+        return n_batch;
+    }
+    return std::max<int32_t>(1, std::min<int32_t>(n_batch, (int32_t) llama_n_ubatch(ctx->lctx.get())));
+}
+
 // 文本 chunk 求值：helper 的等价复刻，外加把每批喂给草稿侧。
 // 必须复刻的原因是 helper 把 batch 藏在内部，DSpark 拿不到中间层特征。详见文档 §14。
 static int32_t eval_text_chunk_feed_draft(mb_mtmd_context * ctx,
@@ -1185,6 +1211,7 @@ static int32_t eval_text_chunk_feed_draft(mb_mtmd_context * ctx,
         }
 
         *new_n_past += batch.n_tokens;
+        layla_prefill_advance(ctx, batch.n_tokens);  // LAYLA
     }
 
     llama_batch_free(batch);
@@ -1329,20 +1356,35 @@ static int eval_prefill_embd_batch(mb_mtmd_context * ctx,
         return 1;
     }
 
-    llama_batch batch = {
-        /*n_tokens =*/ (int32_t) total,
-        /*token    =*/ nullptr,
-        /*embd     =*/ embd.data(),
-        /*pos      =*/ pos.data(),
-        /*n_seq_id =*/ n_seq_id.data(),
-        /*seq_id   =*/ seq_id.data(),
-        /*logits   =*/ logits.data(),
-    };
-
+    // LAYLA: one llama_decode, or with progress asked for one per ubatch. A slice takes
+    // its share of each of the n_pos position sections, as mtmd's batch views do.
+    const size_t step = (size_t) layla_prefill_step(ctx, (int32_t) total);
+    std::vector<llama_pos> pos_slice;
     const int64_t t0 = ggml_time_ms();
-    if (llama_decode(ctx->lctx.get(), batch) != 0) {
-        set_error(ctx, "embd-batch: llama_decode failed");
-        return -1;
+    for (size_t at = 0; at < total; at += step) {
+        const size_t n = std::min(step, total - at);
+        llama_pos * slice_pos = pos.data();
+        if (n != total) {
+            pos_slice.clear();
+            for (int32_t s = 0; s < n_pos; ++s) {
+                pos_slice.insert(pos_slice.end(), pos.begin() + (s * total + at), pos.begin() + (s * total + at + n));
+            }
+            slice_pos = pos_slice.data();
+        }
+        llama_batch batch = {
+            /*n_tokens =*/ (int32_t) n,
+            /*token    =*/ nullptr,
+            /*embd     =*/ embd.data() + at * (size_t) n_embd,
+            /*pos      =*/ slice_pos,
+            /*n_seq_id =*/ n_seq_id.data() + at,
+            /*seq_id   =*/ seq_id.data() + at,
+            /*logits   =*/ logits.data() + at,
+        };
+        if (llama_decode(ctx->lctx.get(), batch) != 0) {
+            set_error(ctx, "embd-batch: llama_decode failed");
+            return -1;
+        }
+        layla_prefill_advance(ctx, (int32_t) n);
     }
     fprintf(stderr, "[MBMtmd] embd-batch: %zu token 合成一个 embedding 批次（%s，%lld ms）\n",
             total, mrope ? "M-RoPE" : "1D", (long long) (ggml_time_ms() - t0));
@@ -1414,14 +1456,19 @@ static int eval_prefill(mb_mtmd_context * ctx,
         if (!is_image) {
             // 投机开着时走本地版本：它把每个文本 batch 都喂给草稿侧，这是 App（多模态）
             // 路径上唯一能让草稿拿到 prompt 特征的地方；关掉投机关或非文本 chunk 走原 helper。
+            // LAYLA: and when the layla prefill asked for progress, which needs its batches.
             const bool is_text = mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT;
-            if (is_text && ctx->spec_enabled && ctx->spec) {
+            if (is_text && ((ctx->spec_enabled && ctx->spec) || ctx->layla_prefill_progress)) {
                 res = eval_text_chunk_feed_draft(
-                    ctx, chunk, n_past, /*seq_id=*/0, ctx->n_batch, chunk_logits_last, &n_past);
+                    ctx, chunk, n_past, /*seq_id=*/0, layla_prefill_step(ctx, ctx->n_batch),
+                    chunk_logits_last, &n_past);
             } else {
                 res = mtmd_helper_eval_chunk_single(
                     ctx->vision.get(), ctx->lctx.get(), chunk,
                     n_past, /*seq_id=*/0, ctx->n_batch, chunk_logits_last, &n_past);
+                if (res == 0) {
+                    layla_prefill_advance(ctx, (int32_t) mtmd_input_chunk_get_n_tokens(chunk));  // LAYLA
+                }
             }
             continue;
         }
@@ -1459,6 +1506,9 @@ static int eval_prefill(mb_mtmd_context * ctx,
             res = mtmd_helper_eval_chunk_single(
                 ctx->vision.get(), ctx->lctx.get(), chunk,
                 n_past, /*seq_id=*/0, ctx->n_batch, chunk_logits_last, &n_past);
+        }
+        if (res == 0) {
+            layla_prefill_advance(ctx, n_tok);  // LAYLA
         }
         image_index++;
     }
@@ -1799,6 +1849,14 @@ static bool moe_adaptive_ubatch(mb_mtmd_context * ctx, bool has_image, int n_tok
     return recreate_lctx(ctx, ctx->n_ctx_cur, want);
 }
 
+// LAYLA: llama_model_params.progress_callback, forwarded as mb_mtmd_params' load
+// progress for the main model.
+static bool layla_model_load_progress(float progress, void * user_data) {
+    const auto * params = static_cast<const mb_mtmd_params *>(user_data);
+    params->layla_load_progress("text_model", progress, params->layla_load_progress_user_data);
+    return true;
+}
+
 mb_mtmd_context * mb_mtmd_init(const char * model_path,
                                const char * mmproj_path,
                                const char * moe_experts_path,
@@ -1875,6 +1933,10 @@ mb_mtmd_context * mb_mtmd_init(const char * model_path,
                 ctx->moe_k_prefill, ctx->moe_k_decode);
     }
 
+    if (params.layla_load_progress) {  // LAYLA
+        mparams.progress_callback           = layla_model_load_progress;
+        mparams.progress_callback_user_data = &params;
+    }
     ctx->model.reset(llama_model_load_from_file(model_path, mparams));
     if (!ctx->model) {
         set_error(ctx.get(), std::string("Failed to load model from: ") + model_path);
@@ -2026,10 +2088,17 @@ mb_mtmd_context * mb_mtmd_init(const char * model_path,
         vparams.image_max_slice_nums  = params.image_max_slice_nums;
 
         const double before_mmproj = footprint_mib();
+        // LAYLA: mtmd reports no progress of its own, so only the stage is known.
+        if (params.layla_load_progress) {
+            params.layla_load_progress("mmproj_model", -1.0f, params.layla_load_progress_user_data);
+        }
         ctx->vision.reset(mtmd_init_from_file(mmproj_path, ctx->model.get(), vparams));
         if (!ctx->vision) {
             set_error(ctx.get(), std::string("Failed to load mmproj from: ") + mmproj_path);
             return nullptr;
+        }
+        if (params.layla_load_progress) {
+            params.layla_load_progress("mmproj_model", 1.0f, params.layla_load_progress_user_data);
         }
         fprintf(stderr, "[MBMtmd] footprint after mmproj load: %.0f -> %.0f MiB (+%.0f MiB)\n",
                 before_mmproj, footprint_mib(), footprint_mib() - before_mmproj);
@@ -3181,7 +3250,9 @@ int mb_mtmd_layla_prefill_prompt(mb_mtmd_context * ctx,
                                  const size_t * image_sizes,
                                  int32_t n_images,
                                  int32_t token_budget,
-                                 int32_t * n_new_tokens) {
+                                 int32_t * n_new_tokens,
+                                 mb_mtmd_layla_progress_callback on_progress,
+                                 void * user_data) {
     if (!ctx || !ctx->lctx || !ctx->vision || !prompt) {
         if (ctx) set_error(ctx, "layla_prefill_prompt: not a multimodal context");
         return -1;
@@ -3236,6 +3307,20 @@ int mb_mtmd_layla_prefill_prompt(mb_mtmd_context * ctx,
         return -2;
     }
 
+    // Progress is told from the decode paths through the context, for this call only.
+    struct progress_scope {
+        mb_mtmd_context * ctx;
+        ~progress_scope() {
+            ctx->layla_prefill_progress = nullptr;
+            ctx->layla_prefill_progress_user_data = nullptr;
+        }
+    } progress_guard{ctx};
+    ctx->layla_prefill_progress = on_progress;
+    ctx->layla_prefill_progress_user_data = user_data;
+    ctx->layla_prefill_done = 0;
+    ctx->layla_prefill_total = new_tokens;
+    layla_prefill_advance(ctx, 0);
+
     const llama_pos start_n_past = ctx->n_past;
     llama_pos new_n_past = start_n_past;
     const double t_prefill_start = now_ms();
@@ -3246,6 +3331,10 @@ int mb_mtmd_layla_prefill_prompt(mb_mtmd_context * ctx,
         return -1;
     }
     ctx->n_past = new_n_past;
+    // Every path has reported its tokens by now; this only covers one that could not.
+    if (ctx->layla_prefill_done < new_tokens) {
+        layla_prefill_advance(ctx, new_tokens - ctx->layla_prefill_done);
+    }
     perf_add_prep  (ctx, t_prefill_start - t0);
     perf_add_prefill(ctx, new_tokens, t_prefill_start);
 

@@ -287,6 +287,8 @@ minicpm_engine * minicpm_load(const minicpm_load_params * params, char * error, 
     mp.moe_lookahead_prefetch_depth = prefetch;
     mp.moe_prewarm_level = 0;
     mp.spec_draft_n_max = 0;
+    mp.layla_load_progress = params->on_progress;
+    mp.layla_load_progress_user_data = params->user_data;
 
     mb_mtmd_context * ctx = mb_mtmd_init(params->model_path,
                                          params->mmproj_path,

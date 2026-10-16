@@ -171,6 +171,26 @@ struct stream_context {
     }
 };
 
+// Prompt processing progress, sent as llama-server sends it for return_progress: the
+// whole prompt's tokens, the ones the cache already held, and the ones in the cache so
+// far, cached ones included, so the overall progress is processed / total.
+struct prefill_progress {
+    const stream_context * stream;
+    int32_t cache_n;
+    std::chrono::steady_clock::time_point started;
+};
+
+void send_prefill_progress(int32_t n_done, int32_t n_total, void * user_data) {
+    const auto * p = static_cast<const prefill_progress *>(user_data);
+    const auto elapsed = std::chrono::steady_clock::now() - p->started;
+    p->stream->send({{"choices", json::array()},
+                     {"prompt_progress",
+                      {{"total", p->cache_n + n_total},
+                       {"cache", p->cache_n},
+                       {"processed", p->cache_n + n_done},
+                       {"time_ms", std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()}}}});
+}
+
 json timings_json(const mb_mtmd_perf & perf, int32_t cache_n) {
     auto per_second = [](double n, double ms) { return ms > 0 ? n * 1000.0 / ms : 0.0; };
     return {
@@ -250,10 +270,15 @@ std::string serve(minicpm_engine * e,
         image_data.push_back(images[i].data());
         image_sizes.push_back(images[i].size());
     }
+    const stream_context stream{on_chunk, user_data, task.stream, completion_id(),
+                                static_cast<int64_t>(std::time(nullptr))};
+    prefill_progress progress{&stream, cache_n, std::chrono::steady_clock::now()};
     int32_t new_tokens = 0;
     const int rc = mb_mtmd_layla_prefill_prompt(e->ctx, suffix.c_str(), image_data.data(), image_sizes.data(),
                                                 static_cast<int32_t>(image_data.size()), n_ctx - cache_n,
-                                                &new_tokens);
+                                                &new_tokens,
+                                                task.stream && task.return_progress ? send_prefill_progress : nullptr,
+                                                &progress);
     if (rc == -2) {
         // Nothing was written, so a cache this request meant to extend is still good.
         if (reuse) {
@@ -268,10 +293,6 @@ std::string serve(minicpm_engine * e,
     e->kv_tokens = cache_n + new_tokens;
     const int32_t prompt_tokens = e->kv_tokens;
 
-    const stream_context stream{on_chunk, user_data, task.stream, completion_id(),
-                                static_cast<int64_t>(std::time(nullptr))};
-    stream.send({{"choices", json::array()},
-                 {"prompt_progress", {{"total", prompt_tokens}, {"cache", cache_n}, {"processed", new_tokens}}}});
     stream.delta({{"role", "assistant"}, {"content", nullptr}});
 
     // Generation, sampled the way llama-server samples.

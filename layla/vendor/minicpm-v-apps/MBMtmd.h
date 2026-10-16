@@ -85,6 +85,11 @@ typedef struct mb_mtmd_params {
     // When enabled the bridge also sets LLAMA_MOE_WINDOW_MAX_ROWS = n_max + 1 before the
     // target model load, and n_rs_seq = n_max on the target/draft contexts for rollback.
     int   spec_draft_n_max;
+    // LAYLA: load progress for mb_mtmd_init, as llama-server reports it. stage is
+    // "text_model" or "mmproj_model"; progress runs 0..1, or is negative where the loader
+    // cannot measure it (the vision model). Called on the loading thread; NULL = none.
+    void (*layla_load_progress)(const char * stage, float progress, void * user_data);
+    void * layla_load_progress_user_data;
 } mb_mtmd_params;
 
 // Loop return value.
@@ -296,19 +301,29 @@ int32_t mb_mtmd_layla_n_ctx(const mb_mtmd_context * ctx);
 struct llama_context * mb_mtmd_layla_llama_context(mb_mtmd_context * ctx);
 const struct llama_model * mb_mtmd_layla_model(const mb_mtmd_context * ctx);
 
+// Prefill progress: n_done of the n_total tokens the prompt adds are in the KV cache.
+typedef void (*mb_mtmd_layla_progress_callback)(int32_t n_done, int32_t n_total, void * user_data);
+
 // Appends `prompt` to the KV cache through the bridge's prefill path, with logits for
 // its last token. Images appear in the text as mtmd's default media marker, one per
 // image, in order; each is an encoded file (PNG, JPEG, ...) in memory. n_new_tokens,
 // when not NULL, receives the tokens the prompt adds (image embeddings included).
 // Returns 0 on success; -2, without touching the KV cache, when that is more than
 // token_budget; -1 on any other failure (see mb_mtmd_get_last_error).
+//
+// on_progress, when not NULL, is called on this thread once the prompt is tokenized
+// (n_done 0), after every ubatch it decodes, and with n_done == n_total at the end.
+// Asking for it costs nothing beyond the calls: the prefill is decoded one ubatch per
+// llama_decode instead of one llama_decode split into the same ubatches.
 int mb_mtmd_layla_prefill_prompt(mb_mtmd_context * ctx,
                                  const char * prompt,
                                  const unsigned char * const * images,
                                  const size_t * image_sizes,
                                  int32_t n_images,
                                  int32_t token_budget,
-                                 int32_t * n_new_tokens);
+                                 int32_t * n_new_tokens,
+                                 mb_mtmd_layla_progress_callback on_progress,
+                                 void * user_data);
 
 // Appends one token the caller sampled, through the bridge's decode step (MoE top-k,
 // decode timing), leaving logits for it. Returns 0, or -1 on failure.
